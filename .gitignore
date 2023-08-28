@@ -1,0 +1,8 @@
+*.idea/*
+*/__pycache__/*
+*_bak*.py
+*checkpoints/*
+analysis/
+data/*
+*.ipynb
+*.yaml
