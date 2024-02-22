@@ -36,6 +36,8 @@ _C.EVAL.TOPK = 1
 _C.MODEL = CfgNode()
 _C.MODEL.TEXT_ENCODER_MODEL = os.path.join(_C.GLOBAL.ROOT_DIR, 'models/chinesebert/chinbert-base/')
 _C.MODEL.GEO_ENCODER_MODEL = os.path.join(_C.GLOBAL.ROOT_DIR, 'models/gpsbert/gpsbert-base/')
+_C.MODEL.MGEO_CONFIG = os.path.join(_C.GLOBAL.ROOT_DIR, 'models/mgeo/gis_config.json')
+_C.MODEL.MGEO_MODEL = os.path.join(_C.GLOBAL.ROOT_DIR, 'models/mgeo/checkpoint_09.pth')
 # _C.MODEL.ENCODER = { 'bert': 'bert-base-uncased', 
 #                 'distilbert': 'distilbert-base-uncased', 
 #                 'roberta': 'roberta-base',

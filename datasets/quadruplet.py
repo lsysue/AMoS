@@ -85,7 +85,7 @@ class Quadruplets(data.Dataset):
             positive_candidates = torch.cat((positive_candidates, positive_padding), dim=0)
             positive_indices = torch.cat((positive_indices.to(torch.long), torch.tensor([anchor_index], device=self.device, dtype=torch.long).repeat(n_padding)), dim=0)
         else:
-            n_padding = n_positive - len(positive_indices)
+            n_padding = n_positive
             positive_padding = anchor.clone().repeat(n_padding, 1)
             positive_padding_noise = torch.randn(positive_padding.shape, device=self.device) * 0.01
             positive_candidates = positive_padding + positive_padding_noise
@@ -106,25 +106,27 @@ class Quadruplets(data.Dataset):
             # weak_positive_labels = torch.ones(size=weak_positive_indices.shape, device=self.device)
             weak_positive_labels = labels[weak_positive_indices]
             
-            weak_positive_labels = torch.where(torch.logical_or(self.geo_positive_probs[weak_positive_indices] >= 0.9999, self.text_positive_probs[weak_positive_indices] >= 0.9999), 1.0, 0.0)
+            # weak_positive_labels = torch.where(self.geo_positive_probs[weak_positive_indices] > 0.995, 1.0, 0.0)
+            weak_positive_labels = torch.where(torch.logical_or(self.geo_positive_probs[weak_positive_indices] >= 0.998, self.text_positive_probs[weak_positive_indices] >= 0.998), 1.0, 0.0)
             weak_positive_tlabels = tlabels[weak_positive_indices]
         elif min(weak_positive_indices.shape) and len(weak_positive_indices) < n_weak_positive:
             n_padding = n_weak_positive - len(weak_positive_indices)
             weak_positive_candidates = self.data[weak_positive_indices]
             weak_positive_padding = anchor.clone().repeat(n_padding, 1)
-            weak_positive_padding_noise = torch.randn(weak_positive_padding.shape, device=self.device) * 0.001
+            weak_positive_padding_noise = torch.randn(weak_positive_padding.shape, device=self.device) * 0.00001
             weak_positive_padding += weak_positive_padding_noise
             weak_positive_candidates = torch.cat((weak_positive_candidates, weak_positive_padding), dim=0)
             # weak_positive_labels = torch.ones(size=weak_positive_indices.shape, device=self.device)
             weak_positive_labels = labels[weak_positive_indices]
-            weak_positive_labels = torch.where(torch.logical_or(self.geo_positive_probs[weak_positive_indices] >= 0.9999, self.text_positive_probs[weak_positive_indices] >= 0.9999), 1.0, 0.0)
+            # weak_positive_labels = torch.where(self.geo_positive_probs[weak_positive_indices] > 0.995, 1.0, 0.0)
+            weak_positive_labels = torch.where(torch.logical_or(self.geo_positive_probs[weak_positive_indices] >= 0.998, self.text_positive_probs[weak_positive_indices] >= 0.998), 1.0, 0.0)
             weak_positive_indices = torch.cat((weak_positive_indices.to(torch.long), torch.tensor([anchor_index], device=self.device, dtype=torch.long).repeat(n_padding)), dim=0)
             weak_positive_labels = torch.cat((weak_positive_labels.to(torch.long), torch.tensor([1], device=self.device, dtype=torch.long).repeat(n_padding)), dim=0)
             weak_positive_tlabels = tlabels[weak_positive_indices]
         else:
-            n_padding = n_weak_positive - len(weak_positive_indices)
+            n_padding = n_weak_positive
             weak_positive_padding = anchor.clone().repeat(n_padding, 1)
-            weak_positive_padding_noise = torch.randn(weak_positive_padding.shape, device=self.device) * 0.002
+            weak_positive_padding_noise = torch.randn(weak_positive_padding.shape, device=self.device) * 0.00001
             weak_positive_candidates = weak_positive_padding + weak_positive_padding_noise
             weak_positive_indices = torch.tensor([anchor_index], device=self.device, dtype=torch.long).repeat(n_padding)
             weak_positive_labels = labels[weak_positive_indices]
@@ -143,23 +145,33 @@ class Quadruplets(data.Dataset):
         negative_labels = labels[negative_indices]
         negative_tlabels = tlabels[negative_indices]
 
-        sample_indices = torch.cat((torch.tensor([anchor_index], dtype=torch.long, device=self.device), positive_indices.to(torch.long), weak_positive_indices.to(torch.long), negative_indices.to(torch.long)), dim=0)
-        text_distance = self.text_distance - torch.diag(torch.diag(self.text_distance))
-        geo_distance = self.geo_distance - torch.diag(torch.diag(self.geo_distance))
-        text_distance = text_distance[sample_indices, :][:, sample_indices]
-        geo_distance = geo_distance[sample_indices, :][:, sample_indices]
-        sample_labels = labels[sample_indices[1:]]
-        sample_tlabels = labels[sample_indices[1:]]
+        candidate_indices = torch.cat((positive_indices.to(torch.long), weak_positive_indices.to(torch.long), negative_indices.to(torch.long)), dim=0)
+        # random_order = torch.randperm(candidate_indices.size(0))
+        # shuffled_candidate_indices = candidate_indices[random_order]
+        # sample_indices = torch.cat((torch.tensor([anchor_index], dtype=torch.long, device=self.device), shuffled_candidate_indices), dim=0)
+        sample_indices = torch.cat((torch.tensor([anchor_index], dtype=torch.long, device=self.device), candidate_indices), dim=0)
+        # text_distance = self.text_distance - torch.diag(torch.diag(self.text_distance))
+        # geo_distance = self.geo_distance - torch.diag(torch.diag(self.geo_distance))
+        # text_distance = text_distance[sample_indices, :][:, sample_indices] + torch.eye(len(sample_indices), device=self.device)
+        # geo_distance = geo_distance[sample_indices, :][:, sample_indices] + torch.eye(len(sample_indices), device=self.device)
+        # text_distance = text_distance[sample_indices, :][:, sample_indices]
+        # geo_distance = geo_distance[sample_indices, :][:, sample_indices]
+        text_distance = self.text_distance[sample_indices, :][:, sample_indices]
+        geo_distance = self.geo_distance[sample_indices, :][:, sample_indices]
+        # sample_labels = labels[shuffled_candidate_indices]
+        # sample_tlabels = labels[shuffled_candidate_indices]
+        sample_labels = labels[candidate_indices]
+        sample_tlabels = labels[candidate_indices]
 
-        weak_positive_texts = self.text_positive_probs[weak_positive_indices]
-        weak_positive_geos = self.geo_positive_probs[weak_positive_indices]
-        wfp_indices = torch.argwhere(labels - tlabels == 1).view(-1)
-        wfp_geo_probs = self.geo_positive_probs[wfp_indices]
-        wfp_text_probs = self.text_positive_probs[wfp_indices]
-        # fp_probs = torch.index_select(self.geo_positive_probs, 0, fp_indices)
-        wfn_indices = torch.argwhere(tlabels - labels == 1).view(-1)
-        wfn_geo_probs = self.geo_positive_probs[wfn_indices]
-        wfn_text_probs = self.text_positive_probs[wfn_indices]
+        # weak_positive_texts = self.text_positive_probs[weak_positive_indices]
+        # weak_positive_geos = self.geo_positive_probs[weak_positive_indices]
+        # wfp_indices = torch.argwhere(labels - tlabels == 1).view(-1)
+        # wfp_geo_probs = self.geo_positive_probs[wfp_indices]
+        # wfp_text_probs = self.text_positive_probs[wfp_indices]
+        # # fp_probs = torch.index_select(self.geo_positive_probs, 0, fp_indices)
+        # wfn_indices = torch.argwhere(tlabels - labels == 1).view(-1)
+        # wfn_geo_probs = self.geo_positive_probs[wfn_indices]
+        # wfn_text_probs = self.text_positive_probs[wfn_indices]
 
         return (anchor, positive_candidates, weak_positive_candidates, negative_candidates, text_distance, geo_distance), \
             sample_labels, sample_tlabels, sample_indices

@@ -6,7 +6,6 @@ import logging
 import warnings
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -16,14 +15,13 @@ from torch.nn import TripletMarginWithDistanceLoss
 from torch.utils.data import DataLoader
 
 from sklearn.cluster import KMeans, DBSCAN, OPTICS
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.metrics import (pair_confusion_matrix,
                             rand_score, adjusted_rand_score,
                             normalized_mutual_info_score, 
                             adjusted_mutual_info_score)
 from sklearn.metrics import (precision_score, recall_score, f1_score)
 
-import scipy
 from scipy.spatial.distance import pdist, cdist, squareform
 
 from tqdm import tqdm
@@ -32,16 +30,15 @@ from datetime import datetime
 
 from datasets.eleme import Eleme
 from datasets.quadruplet import Quadruplets, Graphset
-from datasets.datautils import normalize
-from clustering.finch import FINCH, AdvFINCH
-from clustering.mmnn import NearestNeighborClustering
+from datasets.datautils import normalize, top_k
+from clustering.finch import FINCH, AdvFINCH, NearestNeighborClustering
 from models.modelutils import (load_pretrained_model, save_checkpoint, load_checkpoint, create_output_dirs)
 from models.modelutils import AverageMeter
 from models.basenet import BaseFC, ThreeLayerFC, FourLayerFC
 from models.transformer.bert import Bert
 from models.quadrupletnet import QuadrupletNet
-from models.graphnet import GraphNet_with_Classifier, GraphNet
-from loss.infonce import InfoNCE, QuadraInfoNCE
+from models.graphnet import GraphNet
+from loss.infonce import InfoNCE, QuadraInfoNCE, TEST
 from loss.triplet import TripletLoss, QuadrupletLoss
 import misc.distributed_helper as du_helper
 from config.param_parser import load_config, arg_parser
@@ -58,7 +55,7 @@ def cluster_algorithm(cfg):
     elif cfg.ITERCLUSTER.METHOD == 'advfinch':
         model = AdvFINCH(initial_rank=None, required_n_cluster=None, exit_n_cluster=2, metric=cfg.ITERCLUSTER.DIST_METRIC, enable_hierarchy=False, ensure_early_exit=True, verbose=True, use_ann_above_samples=70000)
     elif cfg.ITERCLUSTER.METHOD == 'nncluster':
-        model = NearestNeighborClustering(initial_rank=None, metric=cfg.ITERCLUSTER.DIST_METRIC, mode='strong', verbose=True)
+        model = NearestNeighborClustering(initial_rank=None, metric=cfg.ITERCLUSTER.DIST_METRIC, verbose=True, use_ann_above_samples=70000)
     elif cfg.ITERCLUSTER.METHOD == 'kmeans':
         model = KMeans(n_clusters=cfg.ITERCLUSTER.K)
     elif cfg.ITERCLUSTER.METHOD == 'dbscan':
@@ -80,7 +77,7 @@ def base_model(cfg):
     return model
 
 
-def clustering_train_epoch(train_loader, model, 
+def train_epoch(train_loader, model, 
                         criterion, optimizer, 
                         epoch, cfg, device, output_path, is_master_proc=True):
     loss_meter = AverageMeter()
@@ -90,23 +87,32 @@ def clustering_train_epoch(train_loader, model,
 
     # Training loop
     start = time.time()
-    data = torch.tensor([])
-    for batch_idx, (inputs, _, _, _) in tqdm(enumerate(train_loader)):
+    conf_mat_sum = np.zeros([4])
+    for batch_idx, (inputs, targets) in tqdm(enumerate(train_loader)):
         optimizer.zero_grad()
         # anchor_input, positive_inputs, weak_positive_inputs, negative_inputs = inputs
+        anchor_target, positive_targets, weak_positive_targets, negative_targets = targets
+        # anchor_index, positive_indices, weak_positive_indices, negative_indices = indices
         batch_size = torch.tensor(inputs[0].size(0)).to(device)
 
-        anchor_output, positive_outputs, weak_positive_outputs, negative_outputs = model(inputs)
-        data = torch.cat((data, anchor_output.squeeze(1).cpu()), dim=0)
+        targets = torch.cat((positive_targets, negative_targets), dim=1).to(torch.long)
+        # anchor_output, positive_outputs, weak_positive_outputs, negative_outputs = model(inputs)
+        outputs = model(inputs)
+        # print(outputs.shape, targets.shape)
+        outputs = outputs.reshape(-1, outputs.shape[-1])
+        targets = targets.reshape(-1).to(torch.long)
+        # print(outputs.shape, targets.shape)
 
-        if cfg.LOSS.TYPE in ['quadrainfonce', 'quadruplet']:
-            loss = criterion(anchor_output, positive_outputs, weak_positive_outputs, negative_outputs)
-        elif cfg.LOSS.TYPE in ['infonce', 'triplet']:
-            loss = criterion(anchor_output, positive_outputs, negative_outputs)
+        loss = criterion(outputs, targets)
 
         # Compute gradient and perform optimization step
         loss.backward()
         optimizer.step()
+
+        pred_labels = torch.argmax(outputs, dim=-1).cpu()
+        targets = targets.cpu()
+        conf_mat = confusion_matrix(targets, pred_labels, labels=range(2)).flatten()
+        conf_mat_sum += conf_mat
 
         # Average loss across all gpu processes # TODO: distributed training
         # if cfg.NUM_GPUS > 1:
@@ -115,6 +121,7 @@ def clustering_train_epoch(train_loader, model,
         # else:
         #     batch_size_world = batch_size
         batch_size_world = batch_size
+
         batch_size_world = batch_size_world.item()
 
         # Update running loss
@@ -125,18 +132,25 @@ def clustering_train_epoch(train_loader, model,
             logging.critical(f"Train Epoch: {epoch} [{loss_meter.count}/{len(train_loader.dataset)} | {100. * (loss_meter.count / len(train_loader.dataset)):.1f}%]\t"
                       f"Loss: {loss_meter.val} ({loss_meter.avg}) \t")
 
+    tn, fp, fn, tp = conf_mat_sum.tolist()
+    if tp == 0:
+        prec, recall = 0.0, 0.0
+        f1 = 0.0
+    else:
+        prec = tp / (tp + fp) 
+        recall = tp / (tp + fn)
+        f1 = 2 * prec * recall / (prec + recall)
+
     if (is_master_proc):
         logging.critical(f"\nTrain set: Average loss: {loss_meter.avg}\n")
         logging.critical(f"epoch:{epoch} runtime:{(time.time()-start)/3600}")
         with open(os.path.join(output_path, 'train_loss.txt'), 'a') as f:
             f.write(f"epoch:{epoch}, runtime:{round((time.time()-start)/3600,2)}, {loss_meter.avg}\n")
-        logging.critical(f"saved to file: {os.path.join(output_path, 'train_loss.txt')}")
-    
-    return data
+        with open(os.path.join(output_path, 'graphnet_trainresult.txt'), 'a') as f:
+            f.write(f"{epoch}, {prec}, {recall}, {f1}\n")
 
 
-
-def clustering_val_epoch(val_loader, model, 
+def val_epoch(val_loader, model, 
                 criterion, epoch, cfg, device, output_path, is_master_proc=True):
     loss_meter = AverageMeter()
     world_size = du_helper.get_world_size()
@@ -145,26 +159,46 @@ def clustering_val_epoch(val_loader, model,
 
     # Training loop
     start = time.time()
-    iter_data = torch.tensor([])
-    for batch_idx, (inputs, _, _, _) in tqdm(enumerate(val_loader)):
+    conf_mat_sum = np.zeros([4])
+    for batch_idx, (inputs, targets) in tqdm(enumerate(val_loader)):
+        # anchor_input, positive_inputs, weak_positive_inputs, negative_inputs = inputs
+        anchor_target, positive_targets, weak_positive_targets, negative_targets = targets
+        # anchor_index, positive_indices, weak_positive_indices, negative_indices = indices
+        batch_size = torch.tensor(inputs[0].size(0)).to(device)
+
+        targets = torch.cat((positive_targets, negative_targets), dim=1).to(torch.long)
+        # anchor_output, positive_outputs, weak_positive_outputs, negative_outputs = model(inputs)
         with torch.no_grad():
-            anchor_output, positive_outputs, weak_positive_outputs, negative_outputs = model(inputs)
-        anchor_output = anchor_output.squeeze(1).cpu()
-        iter_data = torch.cat((iter_data, anchor_output), dim=0)
-    return iter_data
+            outputs = model(inputs)
+        # print(outputs.shape, targets.shape)
+        outputs = outputs.reshape(-1, outputs.shape[-1])
+        targets = targets.reshape(-1).to(torch.long).cpu()
+        # print(outputs.shape, targets.shape)
 
+        pred_labels = torch.argmax(outputs, dim=-1).cpu()
+        conf_mat = confusion_matrix(targets, pred_labels, labels=range(2)).flatten()
+        conf_mat_sum += conf_mat
 
+    tn, fp, fn, tp = conf_mat_sum.tolist()
+    if tp == 0:
+        prec, recall = 0.0, 0.0
+        f1 = 0.0
+    else:
+        prec = tp / (tp + fp) 
+        recall = tp / (tp + fn)
+        f1 = 2 * prec * recall / (prec + recall)
+
+    if (is_master_proc):
+        with open(os.path.join(output_path, 'graphnet_valresult.txt'), 'a') as f:
+            f.write(f"{epoch}, {prec}, {recall}, {f1}\n")
 
 
 def get_rand_index_and_f_measure(labels_true, labels_pred, beta=1.):
     (tn, fp), (fn, tp) = pair_confusion_matrix(labels_true, labels_pred)
     ri = (tp + tn) / (tp + tn + fp + fn)
     ari = 2. * (tp * tn - fn * fp) / ((tp + fn) * (fn + tn) + (tp + fp) * (fp + tn))
-    if tp == 0:
-        p, r, f_beta = 0, 0, 0
-    else:
-        p, r = tp / (tp + fp), tp / (tp + fn)
-        f_beta = (1 + beta**2) * (p * r / ((beta ** 2) * p + r))
+    p, r = tp / (tp + fp), tp / (tp + fn)
+    f_beta = (1 + beta**2) * (p * r / ((beta ** 2) * p + r))
     return p, r, f_beta
 
 def evaluate_clustering(true_labels, cluster_labels):
@@ -181,12 +215,61 @@ def evaluate_clustering(true_labels, cluster_labels):
     pred_labels = cluster_labels[anno_indices].view(-1)
     true_labels = true_labels[anno_indices].view(-1)
 
-    p, r, f_beta = get_rand_index_and_f_measure(true_labels, pred_labels, beta=1.0)
+    p, r, f_beta = get_rand_index_and_f_measure(true_labels, pred_labels)
     ri = rand_score(true_labels, pred_labels)
     ari = adjusted_rand_score(true_labels, pred_labels)
     nmi = normalized_mutual_info_score(true_labels, pred_labels)
     ami = adjusted_mutual_info_score(true_labels, pred_labels)
     return ri, ari, nmi, ami, p, r, f_beta
+
+def evaluate_top_k(true_labels, pred_embedding, cfg):
+    print(pred_embedding.shape)
+    pred_dist = torch.tensor(squareform(pdist(pred_embedding, metric=cfg.DATASET.DIST_METRIC)))
+    pred_dist.fill_diagonal_(2)
+    true_labels = true_labels.unsqueeze(0).repeat((true_labels.shape[-1], 1))
+    true_labels = torch.where(true_labels == torch.diag(true_labels)[:, None], 1, 0)
+    true_labels = true_labels - torch.diag(torch.diag(true_labels))
+
+    true_labels = squareform(true_labels)
+
+    max_matrics = None
+    max_thdhold = None
+
+    # for thd_hold in [0.001, 0.005, 0.01, 0.03, 0.05, 0.07, 0.09]:
+    for thd_hold in [0.001, 0.005, 0.01, 0.03, 0.05, 0.07, 0.09, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.3,
+                     1.5, 1.7, 1.9]:
+
+        cur_thd_hold = thd_hold
+
+        # logging.info(f'embedding distance: {pred_dist}')
+        if cfg.EVAL.THRES_OR_TOPK == 0:
+            # pred_labels = torch.where(pred_dist < cfg.EVAL.THRESHOLD, 1, 0)
+            pred_labels = torch.where(pred_dist < cur_thd_hold, 1, 0)
+        else:
+            topk_indices, _ = top_k(pred_dist, k=cfg.EVAL.TOPK, find_maximum=False)
+            pred_labels = torch.zeros(true_labels.shape)
+            pred_labels[topk_indices[:, 0], topk_indices[:, 1]] = 1
+
+        pred_labels = squareform(pred_labels)
+
+        p = precision_score(true_labels, pred_labels, average='binary')
+        r = recall_score(true_labels, pred_labels, average='binary')
+        f_beta = f1_score(true_labels, pred_labels, average='binary')
+
+        if max_thdhold is None:
+            max_thdhold = cur_thd_hold
+            max_matrics = {'p':p, 'r':r, 'f_beta':f_beta}
+        elif max_matrics['f_beta'] < f_beta:
+            max_thdhold = cur_thd_hold
+            max_matrics = {'p': p, 'r': r, 'f_beta': f_beta}
+
+    print('max_thdhold:', max_thdhold)
+    p = max_matrics['p']
+    r = max_matrics['r']
+    f_beta = max_matrics['f_beta']
+
+    return p, r, f_beta, max_thdhold
+    
 
 
 def train(args, cfg):
@@ -256,7 +339,6 @@ def train(args, cfg):
     if cfg.MODEL.MAIN_ARCH == 'quadrupletnet':
         main_net = QuadrupletNet(base_net)
     elif cfg.MODEL.MAIN_ARCH == 'graphnet':
-        # main_net = GraphNet_with_Classifier(ggnn_n_nodes=cfg.MODEL.GGNN_N_NODES, ggnn_n_edge_types=cfg.MODEL.GGNN_N_EDGE_TYPES, ggnn_d_annotation=cfg.DATA.D_TEXT + cfg.DATA.D_GEO, ggnn_d_state=cfg.MODEL.GGNN_D_STATE, ggnn_n_steps=cfg.MODEL.GGNN_N_STEPS, init_weight = True)
         main_net = GraphNet(ggnn_n_nodes=cfg.MODEL.GGNN_N_NODES, ggnn_n_edge_types=cfg.MODEL.GGNN_N_EDGE_TYPES, ggnn_d_annotation=cfg.DATA.D_TEXT + cfg.DATA.D_GEO, ggnn_d_state=cfg.MODEL.GGNN_D_STATE, ggnn_n_steps=cfg.MODEL.GGNN_N_STEPS, init_weight = True)
     ## SyncBatchNorm
     if cfg.SYNC_BATCH_NORM:
@@ -304,13 +386,15 @@ def train(args, cfg):
     elif cfg.LOSS.TYPE == 'quadrainfonce':
         criterion = QuadraInfoNCE(temperature=cfg.LOSS.TEMPERATURE, weak_temperature=cfg.LOSS.WEAK_TEMPERATURE)
     elif cfg.LOSS.TYPE == 'triplet':
-        # criterion = TripletMarginWithDistanceLoss(distance_function=nn.PairwiseDistance(), margin=cfg.LOSS.MARGIN)
-        criterion = TripletMarginWithDistanceLoss(distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y), margin=cfg.LOSS.MARGIN)
+        criterion = TripletMarginWithDistanceLoss(distance_function=nn.PairwiseDistance(), margin=cfg.LOSS.MARGIN)
+        # criterion = TripletMarginWithDistanceLoss(distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y), margin=cfg.LOSS.MARGIN)
     elif cfg.LOSS.TYPE == 'quadruplet':
         # criterion = QuadrupletLoss(distance_function=nn.PairwiseDistance(), margin=cfg.LOSS.MARGIN)
         criterion = QuadrupletLoss(distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y), margin=cfg.LOSS.MARGIN)
     elif cfg.LOSS.TYPE == 'ce':
+        # criterion = TripletMarginWithDistanceLoss(distance_function=nn.PairwiseDistance(), margin=cfg.LOSS.MARGIN)
         criterion = nn.CrossEntropyLoss(reduction='sum')
+        # criterion = MSELoss()
     else:
         assert False, 'Loss Type:{} not recognized'.format(cfg.LOSS.TYPE)
 
@@ -325,52 +409,47 @@ def train(args, cfg):
     # ============================== Data Loaders ==============================
 
     if not os.path.exists(os.path.join(cfg.GLOBAL.DATA_DIR, args.data_path)):
-        dataset_loader = Eleme(cfg, text_encoder='chinesebert', geo_encoder='gpsbert', data_path=os.path.join(cfg.GLOBAL.DATA_DIR, '37841_1d_0216_1590.dat'), save_path=None)
-        dataset, distance_matrice = dataset_loader.__make_dataset__()
+        dataset_loader = Eleme(cfg, text_encoder='chinesebert', geo_encoder='gpsbert', save_path=None)
+        dataset = dataset_loader.__make_dataset__()
     else:
         with open(os.path.join(cfg.GLOBAL.DATA_DIR, args.data_path), 'rb') as f:
             dataset = pickle.load(f)
-        distance_matrice = np.load(os.path.join(cfg.GLOBAL.DATA_DIR, args.data_path.replace('.dat', '_dists.npy')))
 
     from copy import deepcopy
 
-    # text_embedding = torch.Tensor(dataset['parsed_text_embedding'])
-    def text_embedding_mean(x):
-        return np.mean(x, axis=-2, keepdims=True)
-
-    text_embedding_chinesebert = torch.Tensor(list(dataset['parsed_text_embedding_chinesebert'])).reshape(-1, cfg.DATA.D_TEXT)
-    text_embedding_mgeo = torch.Tensor(list(map(text_embedding_mean, dataset['parsed_text_embedding_mgeo']))).reshape(-1, cfg.DATA.D_TEXT)
-    
-    geo_embedding_gpsbert = torch.Tensor(list(dataset['parsed_geo_embedding_gpsbert'])).reshape(-1, cfg.DATA.D_TEXT)
-    geo_embedding_mgeo = torch.Tensor(list(dataset['parsed_geo_embedding_mgeo'])).reshape(-1, cfg.DATA.D_TEXT)
-
-    geo_coordinates = torch.Tensor(list(dataset['parsed_geo']))
-    geo_coordinates[:, 0] = geo_coordinates[:, 0] - 120
-    geo_coordinates[:, 1] = geo_coordinates[:, 1] - 30
-
-    text_embedding = text_embedding_chinesebert
-    if cfg.DATA.ENCODE_GEO:
-        geo_embedding = geo_embedding_mgeo
+    text_embedding = torch.Tensor(dataset['parsed_text_embedding'])
+    if isinstance(dataset['geo_description'][0], str):
+        geo_description = list(map(literal_eval, list(dataset['geo_description'])))
     else:
-        geo_embedding = geo_coordinates.clone()
+        geo_description = list(dataset['geo_description'])
+        # dataset['geo_description'] = geo_description
+    if cfg.DATA.ENCODE_GEO:
+        geo_embedding = torch.Tensor(dataset['geo_embedding'])
+    else:
+        geo_embedding = torch.Tensor(geo_description)
+        geo_embedding = deepcopy(geo_embedding)
+        geo_embedding[:, 0] = geo_embedding[:,0] - 120
+        geo_embedding[:, 1] = geo_embedding[:, 1] - 30
         geo_embedding = geo_embedding.repeat(1, cfg.DATA.D_GEO // geo_embedding.shape[-1])
+    # text_embedding = normalize(text_embedding)
+    # geo_embedding = normalize(geo_embedding)
+    text_distance_matrix = torch.Tensor(dataset['text_distance_matrix'])
+    print(f"====== text distance matrix ======")
+    text_distance_matrix = normalize(text_distance_matrix)
+    # print(text_distance_matrix)
 
-    distance_matrice = torch.Tensor(distance_matrice)
-    text_edit_distance_matrix = distance_matrice[0]
-    geo_haversine_distance_matrix = distance_matrice[1]
-    wifi_intersectionset_iou_matrix = distance_matrice[2]
+    geo_distance_matrix = torch.Tensor(dataset['geo_distance_matrix'])
+    print(f"====== geo distance matrix ======")
+    geo_distance_matrix = normalize(geo_distance_matrix)
+    # print(geo_distance_matrix)
 
-    text_embedding_chinesebert_cosine_distance_matrix = distance_matrice[3]
-    text_embedding_mgeo_cosine_distance_matrix = distance_matrice[4]
-    geo_embedding_gpsbert_cosine_distance_matrix = distance_matrice[5]
-    geo_embedding_mgeo_cosine_distance_matrix = distance_matrice[6]
+    wifi_distance_matrix = torch.Tensor(dataset['wifi_distance_matrix'])
+    print(f"====== wifi distance matrix ======")
+    wifi_distance_matrix = torch.where(torch.isinf(wifi_distance_matrix), 1, wifi_distance_matrix)
+    wifi_distance_matrix = normalize(wifi_distance_matrix)
+    # print(wifi_distance_matrix)
 
-    text_distance_matrix = text_edit_distance_matrix
-    geo_distance_matrix = geo_haversine_distance_matrix
-    wifi_distance_matrix = wifi_intersectionset_iou_matrix
-    
-    true_labels = torch.Tensor(list(dataset['poi_id']))
-    true_labels = torch.where(torch.isnan(true_labels), -1, true_labels)
+    true_labels = torch.Tensor(dataset['true_cluster_label'])
 
     init_data = torch.cat((text_embedding, geo_embedding), dim=-1)
 
@@ -382,12 +461,19 @@ def train(args, cfg):
         logging.info(f'INIT_DIST_FUSION is defaultly set to: e')
         init_multimodal_distance = None
     
-    if cfg.DATASET.ITER_DIST_FUSION == cfg.DATASET.INIT_DIST_FUSION:
-        iter_multimodal_distance = init_multimodal_distance
+    if cfg.DATASET.ITER_DIST_FUSION == 't+g+w+e':
+        iter_multimodal_distance = text_distance_matrix + geo_distance_matrix + wifi_distance_matrix
+    elif cfg.DATASET.ITER_DIST_FUSION == 't+g*w+e':
+        iter_multimodal_distance = cfg.DATASET.FUSION_TEXT_W * text_distance_matrix + cfg.DATASET.FUSION_GEO_W * torch.mul(wifi_distance_matrix, geo_distance_matrix)
     else:
         logging.info(f'ITER_DIST_FUSION is defaultly set to: e')
         iter_multimodal_distance = None
     
+    
+    # p, r, f_beta, threshold = evaluate_top_k(true_labels, init_data, cfg)
+    # print(f'==> Metrics of retrieval:{p}, {r}, {f_beta}')
+    # with open(os.path.join(output_path, 'retrieval_metrics.txt'), "a") as f:
+    #     f.write(f'initial, {threshold}, {p}, {r}, {f_beta}\n')
 
     if args.start_epoch != None:
         start_epoch = args.start_epoch
@@ -397,10 +483,11 @@ def train(args, cfg):
 
     if cfg.DATASET.LABEL_SOURCE == 'cluster':
         if cfg.ITERCLUSTER.METHOD in ['finch', 'advfinch']:
-            init_cluster_labels, n_init_cluster, init_adj_matrix = cluster.forward(init_data, distance=init_multimodal_distance)
+            init_cluster_labels, n_init_cluster, _ = cluster.forward(init_data, distance=init_multimodal_distance)
             init_cluster_labels = init_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
         elif cfg.ITERCLUSTER.METHOD == 'nncluster':
-            init_cluster_labels, n_init_cluster, init_adj_matrix = cluster.forward(init_data, text_dist=text_distance_matrix, geo_dist=geo_distance_matrix, wifi_dist=wifi_distance_matrix)
+            init_cluster_labels, n_init_cluster, _ = cluster.forward(init_data, text_dist=text_distance_matrix, geo_dist=geo_distance_matrix, wifi_dist=wifi_distance_matrix)
+            init_cluster_labels = init_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
         elif cfg.ITERCLUSTER.METHOD in ['kmeans', 'dbscan', 'optics']:
             init_cluster_labels = cluster.fit(init_data).labels_
             init_cluster_labels = torch.tensor(init_cluster_labels)
@@ -411,7 +498,7 @@ def train(args, cfg):
             pickle.dump(cluster_labels, f)
         ri, ari, nmi, ami, p, r, f_beta = evaluate_clustering(true_labels, init_cluster_labels)
         print(f'==> Metrics of clustering:{ri}, {ari}, {nmi}, {ami}\n==> {p}, {r}, {f_beta}')
-        with open(os.path.join(output_path, 'train_cluster_metrics.txt'), "a") as f:
+        with open(os.path.join(output_path, 'cluster_metrics.txt'), "a") as f:
             f.write(f'initial:, {ri}, {ari}, {nmi}, {ami}, {p}, {r}, {f_beta}\n')
     
         print('Saved cluster labels to', cluster_output_path)
@@ -419,15 +506,12 @@ def train(args, cfg):
         train_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=init_cluster_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
         # train_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=iter_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=init_cluster_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
         # train_dataset = Graphset(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, n_candidates = cfg.MODEL.GGNN_N_NODES - 1, cluster_labels=init_cluster_labels, true_labels=true_labels, device=cfg.GLOBAL.DEVICE)
-        val_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=init_cluster_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
-        # val_dataset = Graphset(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, n_candidates = cfg.MODEL.GGNN_N_NODES - 1, cluster_labels=init_cluster_labels, true_labels=true_labels, device=cfg.GLOBAL.DEVICE)
 
     elif cfg.DATASET.LABEL_SOURCE == 'true':
         train_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=true_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
         # train_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=iter_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=true_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
         # train_dataset = Graphset(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, n_candidates = cfg.MODEL.GGNN_N_NODES - 1, cluster_labels=true_labels, true_labels=true_labels, device=cfg.GLOBAL.DEVICE)
-        val_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=true_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
-        # val_dataset = Graphset(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, n_candidates = cfg.MODEL.GGNN_N_NODES - 1, cluster_labels=true_labels, true_labels=true_labels, device=cfg.GLOBAL.DEVICE)
+    val_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=true_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
         
     train_dataloader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=False)
@@ -435,6 +519,7 @@ def train(args, cfg):
     # deliberately to not re-print data loader information
 
     # ============================= Training loop ==============================
+
     for epoch in range(start_epoch + 1, cfg.TRAIN.EPOCHS + 1):
         if (is_master_proc):
             print (f'\nEpoch {epoch}/{cfg.TRAIN.EPOCHS}')
@@ -444,67 +529,68 @@ def train(args, cfg):
         # Train
         if (is_master_proc):
             print(f'==> training with Triplet Loss with criterion:{criterion}')
-            train_data = clustering_train_epoch(train_dataloader, main_net, criterion, optimizer, epoch, cfg, device, output_path, is_master_proc)
-            
-            print(train_data.requires_grad)
-            train_data = train_data.detach()
-            print(train_data.requires_grad)
-
-            if cfg.ITERCLUSTER.METHOD in ['finch', 'advfinch']:
-                iter_cluster_labels, n_train_cluster, iter_adj_matrix = cluster.forward(train_data, distance=iter_multimodal_distance)
-                iter_cluster_labels = iter_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
-            elif cfg.ITERCLUSTER.METHOD == 'nncluster':
-                iter_cluster_labels, n_train_cluster, iter_adj_matrix = cluster.forward(train_data, init_adj_matrix)
-            elif cfg.ITERCLUSTER.METHOD in ['kmeans', 'dbscan', 'optics']:
-                iter_cluster_labels = cluster.fit(train_data).labels_
-                iter_cluster_labels = torch.tensor(iter_cluster_labels)
-
-
-            ri, ari, nmi, ami, p, r, f_beta = evaluate_clustering(true_labels, iter_cluster_labels)
-            print(f'==> Metrics of clustering:{ri}, {ari}, {nmi}, {ami}\n==> {p}, {r}, {f_beta}')
-            with open(os.path.join(output_path, 'train_cluster_metrics.txt'), "a") as f:
-                f.write(f'epoch:{epoch}, {ri}, {ari}, {nmi}, {ami}, {p}, {r}, {f_beta}\n')
+            train_epoch(train_dataloader, main_net, criterion, optimizer, epoch, cfg, device, output_path, is_master_proc)
 
         # ============================= Evaluation =============================
 
         if is_master_proc:
+            # Cluster
+
             # Update embeding
+            iter_data = val_epoch(val_dataloader, main_net, criterion, epoch, cfg, device, output_path, is_master_proc)
 
-            val_data = clustering_val_epoch(val_dataloader, main_net, criterion, epoch, cfg, device, output_path, is_master_proc)
+            # iter_data = init_data.clone()
+            # iter_data = iter_data.detach().view(-1, (cfg.DATA.D_TEXT + cfg.DATA.D_GEO)).to(cfg.GLOBAL.DEVICE)
+            # # iter_data_text, iter_data_geo = torch.chunk(iter_data, 2, dim=-1)
 
-            print('\n=> Clustering')
-            start_time = time.time()
+            # logging.debug(f"EPOCH:{epoch} | curr data before model: {iter_data[0]}")
+            # main_net.eval()
+            # with torch.no_grad():
+            #     # iter_data_text = model.forward(iter_data_text).detach().cpu()
+            #     # iter_data_geo = model.forward(iter_data_geo).detach().cpu()
+            #     iter_data = main_net.base_network.forward(iter_data).detach().cpu()
+            #     # iter_data = normalize(iter_data)
 
-            if cfg.ITERCLUSTER.METHOD in ['finch', 'advfinch']:
-                val_cluster_labels, n_iter_cluster, iter_adj_matrix = cluster.forward(val_data, distance=iter_multimodal_distance)
-                val_cluster_labels = val_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
-            elif cfg.ITERCLUSTER.METHOD == 'nncluster':
-                val_cluster_labels, n_iter_cluster, iter_adj_matrix = cluster.forward(val_data, init_adj_matrix)
-            elif cfg.ITERCLUSTER.METHOD in ['kmeans', 'dbscan', 'optics']:
-                val_cluster_labels = cluster.fit(val_data).labels_
-                val_cluster_labels = torch.tensor(val_cluster_labels)
-            print('Time to cluster: {:.2f}s'.format(time.time()-start_time))
+            # p, r, f_beta, threshold = evaluate_top_k(true_labels, iter_data, cfg)
+            # print(f'==> Metrics of retrieval:{p}, {r}, {f_beta}')
+            # with open(os.path.join(output_path, 'retrieval_metrics.txt'), "a") as f:
+            #     f.write(f'epoch:{epoch}, {threshold}, {p}, {r}, {f_beta}\n')
 
-            if os.path.exists(cluster_output_path):
-                with open(cluster_output_path, "rb") as f:
-                    cluster_labels = pickle.load(f)
-                cluster_labels.insert(cluster_labels.shape[1], f'epoch: {epoch}', val_cluster_labels)
-            else:
-                cluster_labels = pd.DataFrame({f'epoch: {epoch}': val_cluster_labels})
-            with open(cluster_output_path, "wb") as f:
-                pickle.dump(cluster_labels, f)
+            # print('\n=> Clustering')
+            # start_time = time.time()
 
-            ri, ari, nmi, ami, p, r, f_beta = evaluate_clustering(true_labels, val_cluster_labels)
-            print(f'==> Metrics of clustering:{ri}, {ari}, {nmi}, {ami}\n==> {p}, {r}, {f_beta}')
-            with open(os.path.join(output_path, 'val_cluster_metrics.txt'), "a") as f:
-                f.write(f'epoch:{epoch}, {ri}, {ari}, {nmi}, {ami}, {p}, {r}, {f_beta}\n')
+            # if cfg.ITERCLUSTER.METHOD in ['finch', 'advfinch']:
+            #     iter_cluster_labels, n_iter_cluster, _ = cluster.forward(iter_data, distance=iter_multimodal_distance)
+            #     iter_cluster_labels = iter_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
+            # elif cfg.ITERCLUSTER.METHOD == 'nncluster':
+            #     iter_cluster_labels, n_iter_cluster, _ = cluster.forward(iter_data)
+            #     iter_cluster_labels = iter_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
+            # elif cfg.ITERCLUSTER.METHOD in ['kmeans', 'dbscan', 'optics']:
+            #     iter_cluster_labels = cluster.fit(iter_data).labels_
+            #     iter_cluster_labels = torch.tensor(iter_cluster_labels)
+            # print('Time to cluster: {:.2f}s'.format(time.time()-start_time))
 
-            # Save cluster assignments corresponding to unshuffled order of dataset
-            print('Saved cluster labels to', cluster_output_path)
+            # if os.path.exists(cluster_output_path):
+            #     with open(cluster_output_path, "rb") as f:
+            #         cluster_labels = pickle.load(f)
+            #     cluster_labels.insert(cluster_labels.shape[1], f'epoch: {epoch}', iter_cluster_labels)
+            # else:
+            #     cluster_labels = pd.DataFrame({f'epoch: {epoch}': iter_cluster_labels})
+            # with open(cluster_output_path, "wb") as f:
+            #     pickle.dump(cluster_labels, f)
+
+            # ri, ari, nmi, ami, p, r, f_beta = evaluate_clustering(true_labels, iter_cluster_labels)
+            # print(f'==> Metrics of clustering:{ri}, {ari}, {nmi}, {ami}\n==> {p}, {r}, {f_beta}')
+            # with open(os.path.join(output_path, 'cluster_metrics.txt'), "a") as f:
+            #     f.write(f'epoch:{epoch}, {ri}, {ari}, {nmi}, {ami}, {p}, {r}, {f_beta}\n')
+
+            # # Save cluster assignments corresponding to unshuffled order of dataset
+            # print('Saved cluster labels to', cluster_output_path)
             
             # Make processes wait for master process to finish with clustering
             # if cfg.NUM_GPUS > 1:
             #     torch.distributed.barrier()
+
 
         # Save checkpoint # TODO:
         # if torch.cuda.device_count() > 1:
@@ -529,27 +615,27 @@ def train(args, cfg):
                 # 'best_prec1': best_acc,
             }, args.iterative_cluster, cfg.MODEL.MAIN_ARCH, output_path, is_master_proc, filename)
 
-
+        
                 # =================== Compute embeddings and cluster ===================
 
         if args.iterative_cluster and epoch % cfg.ITERCLUSTER.INTERVAL == 0:
             # Rebuild train_loader with new cluster assignments as pseudolabels
             if(is_master_proc):
                 print('\n==> Rebuilding training data loader (quadrupletnet)...')
-            train_dataset = Quadruplets(data=init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=iter_cluster_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
+            train_dataset = Quadruplets(init_data, text_distance=text_distance_matrix, geo_distance=geo_distance_matrix, multimodal_distance=init_multimodal_distance, distance_metric=cfg.DATASET.DIST_METRIC, cluster_labels=iter_cluster_labels, true_labels=true_labels, random_positive_sampling=cfg.DATASET.RANDOM_POSITIVE_SAMPLING, random_weak_positive_sampling=cfg.DATASET.RANDOM_WEAK_POSITIVE_SAMPLING, random_negative_sampling=cfg.DATASET.RANDOM_NEGATIVE_SAMPLING, positive_sampling=cfg.DATASET.POSITIVE_SAMPLING, negative_sampling=cfg.DATASET.NEGATIVE_SAMPLING, weak_positive_sampling=cfg.DATASET.WEAK_POSITIVE_SAMPLING, device=cfg.GLOBAL.DEVICE)
             
             train_dataloader = DataLoader(train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=True)
 
 
 if __name__ == '__main__':
 
-    # random.seed(7)
-    # torch.manual_seed(7)
-    # np.random.seed(7)
-    # torch.cuda.manual_seed(7)
-    # torch.cuda.manual_seed_all(7)
-    # torch.backends.cudnn.benchmark = False
-    # torch.backends.cudnn.deterministic = True
+    random.seed(7)
+    torch.manual_seed(7)
+    np.random.seed(7)
+    torch.cuda.manual_seed(7)
+    torch.cuda.manual_seed_all(7)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
     print ('\n==> Parsing parameters:')

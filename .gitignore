@@ -1,8 +1,12 @@
 *.idea/*
-*/__pycache__/*
-*_bak*.py
-*checkpoints/*
-analysis/
+*.vscode/*
+**/__pycache__/*
+*bak*
+**/checkpoints/*
 data/*
 *.ipynb
 *.yaml
+models/chinesebert/chinbert-base/*
+models/gpsbert/gpsbert-base/*
+models/gpsbert/*.txt
+models/mgeo/*.pth

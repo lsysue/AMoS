@@ -8,7 +8,7 @@ from transformers import (
 )
 from transformers import BertConfig, BertForMaskedLM
 
-VOCAB_SIZE = {4: 159000, 5: 591600, 6: 682400}
+VOCAB_SIZE = {4: 332400, 5: 591600, 6: 682400}
 LEARNING_RATE = 0.001
 BATCH_SIZE = 4
 EPOCHS = 1000

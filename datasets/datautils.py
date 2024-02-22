@@ -4,7 +4,9 @@ import pickle
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from typing import List
 from ast import literal_eval
+from geopy.distance import geodesic
 from scipy.spatial.distance import cdist, pdist, squareform
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.param_parser import load_config, arg_parser
@@ -129,6 +131,40 @@ def levenshtein(text1: str, text2: str):
                 distances_.append(1 + min((distances[i1], distances[i1 + 1], distances_[-1])))
         distances = distances_
     return distances[-1]
+
+def get_text_distance_matrix(text_list: List[str]):
+    n_data = len(text_list)
+    text_distance_matrix = torch.zeros(n_data, n_data)
+    for i, text_i in enumerate(text_list):
+        for j in range(i+1, n_data):
+            text_j = text_list[j]
+            text_distance_matrix[i, j] = text_distance_matrix[j, i] = levenshtein(text_i, text_j)
+    return text_distance_matrix
+
+def get_geo_distance_matrix(geo_list):
+    n_data = len(geo_list)
+    geo_distance_matrix = torch.zeros(n_data, n_data)
+    for i, geo_i in enumerate(geo_list):
+        lon_i, lat_i = geo_i
+        for j in range(i+1, n_data):
+            lon_j, lat_j = geo_list[j]
+            geo_distance_matrix[i, j] = geo_distance_matrix[j, i] = geodesic([lat_i, lon_i], [lat_j, lon_j]).km
+    return geo_distance_matrix
+
+def get_wifi_distance_matrix(wifi_list):    # wifi_list: List[Set]
+    n_data = len(wifi_list)
+    wifi_distance_matrix = torch.zeros(n_data, n_data)
+    for i, wifiset_i in enumerate(wifi_list):
+        if len(wifiset_i) < 1:
+            continue
+        for j in range(i+1, n_data):
+            wifiset_j = wifi_list[j]
+            if len(wifiset_j) < 1:
+                continue
+            intersection_size = len(wifiset_i & wifiset_j) / len(wifiset_i | wifiset_j)
+            wifi_distance_matrix[i, j] = wifi_distance_matrix[j, i] = intersection_size
+    wifi_distance_matrix = torch.ones_like(wifi_distance_matrix) - wifi_distance_matrix
+    return wifi_distance_matrix
 
 def pairwise_distance(x1: torch.Tensor, x2: torch.Tensor, metric: str):
     assert len(x1.shape) >=2 and len(x1.shape) <= 3

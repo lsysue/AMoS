@@ -6,9 +6,6 @@ import logging
 import warnings
 import numpy as np
 import pandas as pd
-import networkx as nx
-# from pyvis.network import Network
-import matplotlib.pyplot as plt
 
 import torch
 import torch.optim as optim
@@ -35,9 +32,9 @@ from datetime import datetime
 
 from datasets.eleme import Eleme
 from datasets.quadruplet import Quadruplets, Graphset
-from datasets.datautils import normalize, top_k
+from datasets.datautils import normalize
 from clustering.finch import FINCH, AdvFINCH
-from clustering.mmnn import StrongNearestNeighborClustering, WeakNearestNeighborClustering
+from clustering.mmnn import NearestNeighborClustering
 from models.modelutils import (load_pretrained_model, save_checkpoint, load_checkpoint, create_output_dirs)
 from models.modelutils import AverageMeter
 from models.basenet import BaseFC, ThreeLayerFC, FourLayerFC
@@ -61,8 +58,7 @@ def cluster_algorithm(cfg):
     elif cfg.ITERCLUSTER.METHOD == 'advfinch':
         model = AdvFINCH(initial_rank=None, required_n_cluster=None, exit_n_cluster=2, metric=cfg.ITERCLUSTER.DIST_METRIC, enable_hierarchy=False, ensure_early_exit=True, verbose=True, use_ann_above_samples=70000)
     elif cfg.ITERCLUSTER.METHOD == 'nncluster':
-        model = StrongNearestNeighborClustering(initial_rank=None, metric=cfg.ITERCLUSTER.DIST_METRIC, verbose=True, use_ann_above_samples=70000)
-        # model = WeakNearestNeighborClustering(initial_rank=None, metric=cfg.ITERCLUSTER.DIST_METRIC, verbose=True, use_ann_above_samples=70000)
+        model = NearestNeighborClustering(initial_rank=None, metric=cfg.ITERCLUSTER.DIST_METRIC, mode='strong', verbose=True)
     elif cfg.ITERCLUSTER.METHOD == 'kmeans':
         model = KMeans(n_clusters=cfg.ITERCLUSTER.K)
     elif cfg.ITERCLUSTER.METHOD == 'dbscan':
@@ -82,60 +78,6 @@ def base_model(cfg):
     elif cfg.MODEL.BASE_ARCH == 'transformer':
         model = Bert(hidden=cfg.DATA.D_TEXT + cfg.DATA.D_GEO, n_layers=2, attn_heads=2)
     return model
-
-
-def clustering_train_epoch(train_loader, model, 
-                        criterion, optimizer, 
-                        epoch, cfg, device, output_path, is_master_proc=True):
-    loss_meter = AverageMeter()
-    world_size = du_helper.get_world_size()
-    # switching to training mode
-    model.train()
-
-    # Training loop
-    start = time.time()
-    data = torch.tensor([])
-    for batch_idx, (inputs, _, _, _) in tqdm(enumerate(train_loader)):
-        optimizer.zero_grad()
-        # anchor_input, positive_inputs, weak_positive_inputs, negative_inputs = inputs
-        batch_size = torch.tensor(inputs[0].size(0)).to(device)
-
-        anchor_output, positive_outputs, weak_positive_outputs, negative_outputs = model(inputs)
-        data = torch.cat((data, anchor_output.squeeze(1).cpu()), dim=0)
-
-        if cfg.LOSS.TYPE in ['quadrainfonce', 'quadruplet']:
-            loss = criterion(anchor_output, positive_outputs, weak_positive_outputs, negative_outputs)
-        elif cfg.LOSS.TYPE in ['infonce', 'triplet']:
-            loss = criterion(anchor_output, positive_outputs, negative_outputs)
-
-        # Compute gradient and perform optimization step
-        loss.backward()
-        optimizer.step()
-
-        # Average loss across all gpu processes # TODO: distributed training
-        # if cfg.NUM_GPUS > 1:
-        #     [loss] = du_helper.all_reduce([loss], avg=True)
-        #     [batch_size_world] = du_helper.all_reduce([batch_size], avg=False)
-        # else:
-        #     batch_size_world = batch_size
-        batch_size_world = batch_size
-        batch_size_world = batch_size_world.item()
-
-        # Update running loss
-        loss_meter.update(loss.item(), batch_size_world)
-
-        # Log
-        if is_master_proc and ((batch_idx + 1) * world_size) % cfg.TRAIN.LOG_INTERVAL == 0:
-            logging.critical(f"Train Epoch: {epoch} [{loss_meter.count}/{len(train_loader.dataset)} | {100. * (loss_meter.count / len(train_loader.dataset)):.1f}%]\t"
-                      f"Loss: {loss_meter.val} ({loss_meter.avg}) \t")
-
-    if (is_master_proc):
-        logging.critical(f"\nTrain set: Average loss: {loss_meter.avg}\n")
-        logging.critical(f"epoch:{epoch} runtime:{(time.time()-start)/3600}")
-        with open(os.path.join(output_path, 'train_loss.txt'), 'a') as f:
-            f.write(f"epoch:{epoch}, runtime:{round((time.time()-start)/3600,2)}, {loss_meter.avg}\n")
-        logging.critical(f"saved to file: {os.path.join(output_path, 'train_loss.txt')}")
-    return data
 
 
 def classification_train_epoch(train_loader, model, 
@@ -170,7 +112,6 @@ def classification_train_epoch(train_loader, model,
         pred_labels = torch.argmax(outputs, dim=-1).cpu()
         outputs = outputs.reshape(-1, outputs.shape[-1])
         ctargets = ctargets.to(torch.long).reshape(-1)
-        # ttargets = ttargets.reshape(-1)
 
         loss = criterion(outputs, ctargets)
 
@@ -218,8 +159,6 @@ def classification_train_epoch(train_loader, model,
                       f"Loss: {loss_meter.val} ({loss_meter.avg}) \t")
     
     adj_matrix = scipy.sparse.csr_matrix((data, (row_indices, col_indices)), shape=(n_nodes, n_nodes))
-    assert adj_matrix.nnz == cnt_pos
-    A = adj_matrix.toarray()
 
     tn, fp, fn, tp = conf_mat_sum.tolist()
     if tp == 0:
@@ -244,24 +183,6 @@ def classification_train_epoch(train_loader, model,
     return adj_matrix
 
 
-def clustering_val_epoch(val_loader, model, 
-                criterion, epoch, cfg, device, output_path, is_master_proc=True):
-    loss_meter = AverageMeter()
-    world_size = du_helper.get_world_size()
-    # switching to training mode
-    model.eval()
-
-    # Training loop
-    start = time.time()
-    iter_data = torch.tensor([])
-    for batch_idx, (inputs, _, _, _) in tqdm(enumerate(val_loader)):
-        with torch.no_grad():
-            anchor_output, positive_outputs, weak_positive_outputs, negative_outputs = model(inputs)
-        anchor_output = anchor_output.squeeze(1).cpu()
-        iter_data = torch.cat((iter_data, anchor_output), dim=0)
-    return iter_data
-
-
 def classification_val_epoch(val_loader, model, 
                 criterion, epoch, cfg, device, output_path, is_master_proc=True):
     loss_meter = AverageMeter()
@@ -279,7 +200,6 @@ def classification_val_epoch(val_loader, model,
     cnt_pos = 0
     for batch_idx, (inputs, _, ttargets, indices) in tqdm(enumerate(val_loader)):
         # anchor_input, positive_inputs, weak_positive_inputs, negative_inputs = inputs
-        # anchor_ctarget, positive_ctargets, weak_positive_ctargets, negative_ctargets = ctargets
         # anchor_ttarget, positive_ttargets, weak_positive_ttargets, negative_ttargets = ttargets
         batch_size = torch.tensor(inputs[0].size(0)).to(device)
         n_nodes += batch_size
@@ -287,13 +207,8 @@ def classification_val_epoch(val_loader, model,
         # ttargets = torch.cat((positive_ttargets, weak_positive_ttargets, negative_ttargets), dim=1).to(torch.long)
         with torch.no_grad():
             outputs = model(inputs)
-        # print(outputs.shape, ctargets.shape)
-        # outputs = outputs.reshape(-1, outputs.shape[-1])
-        # ctargets = ctargets.reshape(-1).to(torch.long).cpu()
-        # ttargets = ttargets.reshape(-1).to(torch.long).cpu()
         ttargets = ttargets.to(torch.long).cpu()
         indices = indices.cpu()
-        # print(outputs.shape, ctargets.shape)
 
         pred_labels = torch.argmax(outputs, dim=-1).cpu()
         for b in range(batch_size):
@@ -308,15 +223,14 @@ def classification_val_epoch(val_loader, model,
             cnt_pos += len(batch_pos_pred)
             anchor_indices = indices[b, 0:1].repeat(1, n_edges).view(-1)[batch_pos_pred]
             candidate_indices = indices[b, batch_indices + 1].view(-1)[batch_pos_pred]
-            # candidate_indices = indices[b, batch_indices].view(-1)[batch_pos_pred]
 
             row_indices = torch.cat((row_indices, anchor_indices), dim=0)
             col_indices = torch.cat((col_indices, candidate_indices), dim=0)
             data = torch.cat((data, batch_pred_labels.view(-1)[batch_pos_pred]), dim=0)
 
     adj_matrix = scipy.sparse.csr_matrix((data, (row_indices, col_indices)), shape=(n_nodes, n_nodes))
-    print(adj_matrix.nnz, cnt_pos)
-    assert adj_matrix.nnz <= cnt_pos
+    # print(adj_matrix.nnz, cnt_pos)
+    # assert adj_matrix.nnz <= cnt_pos
 
     tn, fp, fn, tp = conf_mat_sum.tolist()
     if tp == 0:
@@ -361,7 +275,7 @@ def evaluate_clustering(true_labels, cluster_labels):
     pred_labels = cluster_labels[anno_indices].view(-1)
     true_labels = true_labels[anno_indices].view(-1)
 
-    p, r, f_beta = get_rand_index_and_f_measure(true_labels, pred_labels)
+    p, r, f_beta = get_rand_index_and_f_measure(true_labels, pred_labels, beta=1.0)
     ri = rand_score(true_labels, pred_labels)
     ari = adjusted_rand_score(true_labels, pred_labels)
     nmi = normalized_mutual_info_score(true_labels, pred_labels)
@@ -492,47 +406,52 @@ def train(args, cfg):
     # ============================== Data Loaders ==============================
 
     if not os.path.exists(os.path.join(cfg.GLOBAL.DATA_DIR, args.data_path)):
-        dataset_loader = Eleme(cfg, text_encoder='chinesebert', geo_encoder='gpsbert', save_path=None)
-        dataset = dataset_loader.__make_dataset__()
+        dataset_loader = Eleme(cfg, text_encoder='chinesebert', geo_encoder='gpsbert', data_path=os.path.join(cfg.GLOBAL.DATA_DIR, '37841_1d_0216_1590.dat'), save_path=None)
+        dataset, distance_matrice = dataset_loader.__make_dataset__()
     else:
         with open(os.path.join(cfg.GLOBAL.DATA_DIR, args.data_path), 'rb') as f:
             dataset = pickle.load(f)
+        distance_matrice = np.load(os.path.join(cfg.GLOBAL.DATA_DIR, args.data_path.replace('.dat', '_dists.npy')))
 
     from copy import deepcopy
 
-    text_embedding = torch.Tensor(dataset['parsed_text_embedding'])
-    if isinstance(dataset['geo_description'][0], str):
-        geo_description = list(map(literal_eval, list(dataset['geo_description'])))
-    else:
-        geo_description = list(dataset['geo_description'])
-        # dataset['geo_description'] = geo_description
+    # text_embedding = torch.Tensor(dataset['parsed_text_embedding'])
+    def text_embedding_mean(x):
+        return np.mean(x, axis=-2, keepdims=True)
+
+    text_embedding_chinesebert = torch.Tensor(list(dataset['parsed_text_embedding_chinesebert'])).reshape(-1, cfg.DATA.D_TEXT)
+    text_embedding_mgeo = torch.Tensor(list(map(text_embedding_mean, dataset['parsed_text_embedding_mgeo']))).reshape(-1, cfg.DATA.D_TEXT)
+    
+    geo_embedding_gpsbert = torch.Tensor(list(dataset['parsed_geo_embedding_gpsbert'])).reshape(-1, cfg.DATA.D_TEXT)
+    geo_embedding_mgeo = torch.Tensor(list(dataset['parsed_geo_embedding_mgeo'])).reshape(-1, cfg.DATA.D_TEXT)
+
+    geo_coordinates = torch.Tensor(list(dataset['parsed_geo']))
+    geo_coordinates[:, 0] = geo_coordinates[:, 0] - 120
+    geo_coordinates[:, 1] = geo_coordinates[:, 1] - 30
+
+    text_embedding = text_embedding_chinesebert
     if cfg.DATA.ENCODE_GEO:
-        geo_embedding = torch.Tensor(dataset['geo_embedding'])
+        geo_embedding = geo_embedding_mgeo
     else:
-        geo_embedding = torch.Tensor(geo_description)
-        geo_embedding = deepcopy(geo_embedding)
-        geo_embedding[:, 0] = geo_embedding[:,0] - 120
-        geo_embedding[:, 1] = geo_embedding[:, 1] - 30
+        geo_embedding = geo_coordinates.clone()
         geo_embedding = geo_embedding.repeat(1, cfg.DATA.D_GEO // geo_embedding.shape[-1])
-    # text_embedding = normalize(text_embedding)
-    # geo_embedding = normalize(geo_embedding)
-    text_distance_matrix = torch.Tensor(dataset['text_distance_matrix'])
-    print(f"====== text distance matrix ======")
-    text_distance_matrix = normalize(text_distance_matrix)
-    # print(text_distance_matrix)
 
-    geo_distance_matrix = torch.Tensor(dataset['geo_distance_matrix'])
-    print(f"====== geo distance matrix ======")
-    geo_distance_matrix = normalize(geo_distance_matrix)
-    # print(geo_distance_matrix)
+    distance_matrice = torch.Tensor(distance_matrice)
+    text_edit_distance_matrix = distance_matrice[0]
+    geo_haversine_distance_matrix = distance_matrice[1]
+    wifi_intersectionset_iou_matrix = distance_matrice[2]
 
-    wifi_distance_matrix = torch.Tensor(dataset['wifi_distance_matrix'])
-    print(f"====== wifi distance matrix ======")
-    wifi_distance_matrix = torch.where(torch.isinf(wifi_distance_matrix), 1, wifi_distance_matrix)
-    wifi_distance_matrix = normalize(wifi_distance_matrix)
-    # print(wifi_distance_matrix)
+    text_embedding_chinesebert_cosine_distance_matrix = distance_matrice[3]
+    text_embedding_mgeo_cosine_distance_matrix = distance_matrice[4]
+    geo_embedding_gpsbert_cosine_distance_matrix = distance_matrice[5]
+    geo_embedding_mgeo_cosine_distance_matrix = distance_matrice[6]
 
-    true_labels = torch.Tensor(dataset['true_cluster_label'])
+    text_distance_matrix = text_edit_distance_matrix
+    geo_distance_matrix = geo_haversine_distance_matrix
+    wifi_distance_matrix = wifi_intersectionset_iou_matrix
+    
+    true_labels = torch.Tensor(list(dataset['poi_id']))
+    true_labels = torch.where(torch.isnan(true_labels), -1, true_labels)
 
     init_data = torch.cat((text_embedding, geo_embedding), dim=-1)
 
@@ -544,10 +463,8 @@ def train(args, cfg):
         logging.info(f'INIT_DIST_FUSION is defaultly set to: e')
         init_multimodal_distance = None
     
-    if cfg.DATASET.ITER_DIST_FUSION == 't+g+w+e':
-        iter_multimodal_distance = text_distance_matrix + geo_distance_matrix + wifi_distance_matrix
-    elif cfg.DATASET.ITER_DIST_FUSION == 't+g*w+e':
-        iter_multimodal_distance = cfg.DATASET.FUSION_TEXT_W * text_distance_matrix + cfg.DATASET.FUSION_GEO_W * torch.mul(wifi_distance_matrix, geo_distance_matrix)
+    if cfg.DATASET.ITER_DIST_FUSION == cfg.DATASET.INIT_DIST_FUSION:
+        iter_multimodal_distance = init_multimodal_distance
     else:
         logging.info(f'ITER_DIST_FUSION is defaultly set to: e')
         iter_multimodal_distance = None
@@ -565,7 +482,6 @@ def train(args, cfg):
             init_cluster_labels = init_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
         elif cfg.ITERCLUSTER.METHOD == 'nncluster':
             init_cluster_labels, n_init_cluster, init_adj_matrix = cluster.forward(init_data, text_dist=text_distance_matrix, geo_dist=geo_distance_matrix, wifi_dist=wifi_distance_matrix)
-            init_cluster_labels = init_cluster_labels[:, cfg.ITERCLUSTER.FINCH_PARTITION]
         elif cfg.ITERCLUSTER.METHOD in ['kmeans', 'dbscan', 'optics']:
             init_cluster_labels = cluster.fit(init_data).labels_
             init_cluster_labels = torch.tensor(init_cluster_labels)
@@ -600,7 +516,6 @@ def train(args, cfg):
     # deliberately to not re-print data loader information
 
     # ============================= Training loop ==============================
-    plt.figure()
     for epoch in range(start_epoch + 1, cfg.TRAIN.EPOCHS + 1):
         if (is_master_proc):
             print (f'\nEpoch {epoch}/{cfg.TRAIN.EPOCHS}')
@@ -611,22 +526,21 @@ def train(args, cfg):
         if (is_master_proc):
             print(f'==> training with Triplet Loss with criterion:{criterion}')
             train_adj_matrix = classification_train_epoch(train_dataloader, main_net, criterion, optimizer, epoch, cfg, device, output_path, is_master_proc)
-            # train_adj_matrix = train_adj_matrix.maximum(init_train_adj_matrix)
-            # clustering_train_epoch(train_dataloader, main_net, criterion, optimizer, epoch, cfg, device, output_path, is_master_proc)
+            train_adj_matrix = train_adj_matrix.maximum(init_adj_matrix)
 
             # train_adj_matrix = train_adj_matrix + scipy.sparse.eye(train_dataset.__len__(), format='csr')
             train_adj_matrix = train_adj_matrix.tolil()
             train_adj_matrix.setdiag(0)
 
-            num_clust, iter_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=train_adj_matrix, directed=True, connection='strong', return_labels=True)
+            num_clusters, iter_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=train_adj_matrix, directed=True, connection='strong', return_labels=True)
             iter_cluster_labels = torch.tensor(iter_cluster_labels, dtype=torch.float32)
 
-            # num_clust, iter_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=train_adj_matrix, directed=True, connection='weak', return_labels=True)
+            # num_clusters, iter_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=train_adj_matrix, directed=True, connection='weak', return_labels=True)
             # iter_cluster_labels = torch.tensor(iter_cluster_labels, dtype=torch.float32)
             # transposed_train_adj_matrix = train_adj_matrix.transpose()
             # outliers = np.where(transposed_train_adj_matrix.sum(axis=1) == 0)[0]
-            # iter_cluster_labels[outliers] = torch.arange(num_clust, num_clust + len(outliers), dtype=torch.float32)
-            # num_clust += len(outliers)
+            # iter_cluster_labels[outliers] = torch.arange(num_clusters, num_clusters + len(outliers), dtype=torch.float32)
+            # num_clusters += len(outliers)
 
             ri, ari, nmi, ami, p, r, f_beta = evaluate_clustering(true_labels, iter_cluster_labels)
             print(f'==> Metrics of clustering:{ri}, {ari}, {nmi}, {ami}\n==> {p}, {r}, {f_beta}')
@@ -634,11 +548,11 @@ def train(args, cfg):
                 f.write(f'epoch:{epoch}, {ri}, {ari}, {nmi}, {ami}, {p}, {r}, {f_beta}\n')
 
         # ============================= Evaluation =============================
-
+        
         if is_master_proc:
             # Update embeding
             val_adj_matrix = classification_val_epoch(val_dataloader, main_net, criterion, epoch, cfg, device, output_path, is_master_proc)
-            # val_adj_matrix = val_adj_matrix.maximum(init_val_adj_matrix)
+            val_adj_matrix = val_adj_matrix.maximum(init_adj_matrix)
             # iter_data = clustering_val_epoch(val_dataloader, main_net, criterion, epoch, cfg, device, output_path, is_master_proc)
 
 
@@ -648,31 +562,16 @@ def train(args, cfg):
             # val_adj_matrix = val_adj_matrix + scipy.sparse.eye(val_dataset.__len__(), format='csr')
             val_adj_matrix = val_adj_matrix.tolil()
             val_adj_matrix.setdiag(0)
-            
-            
-            G = nx.Graph(val_adj_matrix)
-            selected_nodes = list(range(20)) 
-            neighbor_nodes = list(G.neighbors(node) for node in selected_nodes)
-            subgraph = G.subgraph(selected_nodes + neighbor_nodes)
-            pos=nx.spring_layout(subgraph) 
-            # nt = Network('1000px', '1000px')
-            nx.draw(subgraph, pos, with_labels=True, node_size=3)
-            plt.cla()
-            plt.show()
-            plt.savefig(os.path.join(output_path, 'graph.png'))
-            
-            # nt.from_nx(G)
-            # nt.show('nx.html')
 
-            num_clust, val_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=val_adj_matrix, directed=True, connection='strong', return_labels=True)
+            num_clusters, val_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=val_adj_matrix, directed=True, connection='strong', return_labels=True)
             val_cluster_labels = torch.tensor(val_cluster_labels, dtype=torch.float32)
 
-            # num_clust, val_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=val_adj_matrix, directed=True, connection='weak', return_labels=True)
+            # num_clusters, val_cluster_labels = scipy.sparse.csgraph.connected_components(csgraph=val_adj_matrix, directed=True, connection='weak', return_labels=True)
             # val_cluster_labels = torch.tensor(val_cluster_labels, dtype=torch.float32)
             # transposed_val_adj_matrix = val_adj_matrix.transpose()
             # outliers = np.where(transposed_val_adj_matrix.sum(axis=1) == 0)[0]
-            # val_cluster_labels[outliers] = torch.arange(num_clust, num_clust + len(outliers), dtype=torch.float32)
-            # num_clust += len(outliers)
+            # val_cluster_labels[outliers] = torch.arange(num_clusters, num_clusters + len(outliers), dtype=torch.float32)
+            # num_clusters += len(outliers)
 
             if os.path.exists(cluster_output_path):
                 with open(cluster_output_path, "rb") as f:
@@ -732,13 +631,13 @@ def train(args, cfg):
 
 if __name__ == '__main__':
 
-    random.seed(7)
-    torch.manual_seed(7)
-    np.random.seed(7)
-    torch.cuda.manual_seed(7)
-    torch.cuda.manual_seed_all(7)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    # random.seed(7)
+    # torch.manual_seed(7)
+    # np.random.seed(7)
+    # torch.cuda.manual_seed(7)
+    # torch.cuda.manual_seed_all(7)
+    # torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
 
 
     print ('\n==> Parsing parameters:')

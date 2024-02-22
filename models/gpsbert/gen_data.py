@@ -11,7 +11,8 @@ DATASET_ID = 37841
 # root_dir = '/mnt/c/Users/ALSC/Documents/POI/'
 root_dir = '/datapool/workspace/3002lsy/repos/Eleme'
 data_dir = os.path.join(root_dir, 'data')
-curr_dir = os.path.join(root_dir, 'models/gpsbert/')
+# curr_dir = os.path.join(root_dir, 'models/gpsbert/')
+curr_dir = os.getcwd()
 print(curr_dir)
 
 # dataset = pd.read_csv(os.path.join(data_dir, '37841_16d.csv'))

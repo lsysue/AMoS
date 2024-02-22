@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,12 +10,48 @@ from torch import Tensor
 from transformers import BertTokenizer, RobertaTokenizer, DistilBertTokenizer
 from transformers import BertModel, RobertaModel, DistilBertModel
 
-sys.path.append('..')
+sys.path.append(os.path.join(os.path.dirname(__file__),'..'))
 from models.chinesebert.tokenizer import ChinBertTokenizer
 from models.chinesebert.modeling_glycebert import GlyceBertModel
+from models.mgeo.mgeo_dataset import GisUtt
+from models.mgeo.tokenization_bert import BertTokenizer as MGeoBertTokenizer
+from models.mgeo.model_mm import MGeo
 from config.param_parser import arg_parser, load_config
 
 from typing import Optional, Union, List
+
+class MGeoEncoder(object):
+    def __init__(self, cfg):
+        super().__init__()
+
+        self.device = cfg.GLOBAL.DEVICE
+
+        self.tokenizer = MGeoBertTokenizer.from_pretrained('/datapool/workspace/3002lsy/huggingface_models/bert-base-chinese')
+        self.model = MGeo(config={'gis_bert_config': cfg.MODEL.MGEO_CONFIG}, text_encoder='/datapool/workspace/3002lsy/huggingface_models/bert-base-chinese', tokenizer=self.tokenizer)
+
+        checkpoint = torch.load(cfg.MODEL.MGEO_MODEL, map_location='cpu')
+        state_dict = checkpoint['model']
+
+        for key in list(state_dict.keys()):
+            if 'bert' in key:
+                encoder_key = key.replace('bert.', '')
+                state_dict[encoder_key] = state_dict[key]
+                del state_dict[key]
+            if 'doc_proj' in key:
+                del state_dict[key]
+        msg = self.model.load_state_dict(state_dict, strict=False)
+        print('load checkpoint from %s' % cfg.MODEL.MGEO_MODEL)
+        print(msg)  
+
+        self.model = self.model.to(self.device)
+
+    def forward(self, text, gis):
+        text_input = self.tokenizer(text, padding='longest', max_length=30, return_tensors="pt").to(self.device)
+        gis_input_ids, gis_token_type_ids, gis_rel_type_ids, gis_absolute_position_ids, gis_relative_position_ids = (['[]'], ['[]'], ['[]'], ['[]'], ['[]'])
+        gis_input = GisUtt(0, 1, self.device)
+        gis_input.update(gis_input_ids, gis_token_type_ids, gis_rel_type_ids, gis_absolute_position_ids, gis_relative_position_ids)
+        text_embedding, gis_embedding = self.model(text_input, gis_input)
+        return text_embedding, gis_embedding
 
 class TextEncoder(object):
     def __init__(self, cfg,
@@ -173,11 +210,36 @@ class LSTMFE(nn.Module):
 
 
 if __name__ == '__main__':
-    sentence = '西子国际步行街7幢1-59'
-    gps = '121.43286|29.33115'
+    sent1 = '西子国际步行街7幢1-59'
+    gps1 = '121.43286|29.33115'
+    sent2 = '西子步行街8幢159'
+    gps2 = '121.43275|29.33120'
+    sent3 = '西子步行街7幢1-39'
+    gps3 = '121.43279|29.33123'
     args = arg_parser().parse_args()
     cfg = load_config(args)
-    text_encoder = TextEncoder(cfg=cfg, device='cpu', finetuning=False, encoder='chinesebert')
-    gps_encoder = GeoEncoder(cfg=cfg, device='cpu', finetuning=False, encoder='chinesebert')
-    text_embedding = text_encoder.forward(sentence)
-    geo_embedding = gps_encoder.forward(sentence)
+    mgeo_encoder = MGeoEncoder(cfg=cfg)
+    # text_encoder = TextEncoder(cfg=cfg, device='cpu', finetuning=False, encoder='chinesebert')
+    # gps_encoder = GeoEncoder(cfg=cfg, device='cpu', finetuning=False, encoder='chinesebert')
+    # text_embedding = text_encoder.forward(sentence)
+    # geo_embedding = gps_encoder.forward(sentence)
+    txt_embed1, gis_embed1= mgeo_encoder.forward(sent1, gps1)
+    txt_embed2, gis_embed2 = mgeo_encoder.forward(sent2, gps2)
+    txt_embed3, gis_embed3 = mgeo_encoder.forward(sent3, gps3)
+    from scipy.spatial.distance import cdist, pdist
+    txt_embed1 = txt_embed1.detach().cpu().squeeze(0).numpy()
+    txt_embed2 = txt_embed2.detach().cpu().squeeze(0).numpy()
+    txt_embed3 = txt_embed3.detach().cpu().squeeze(0).numpy()
+    gis_embed1 = gis_embed1.detach().cpu().squeeze(0).numpy()
+    gis_embed2 = gis_embed2.detach().cpu().squeeze(0).numpy()
+    gis_embed3 = gis_embed3.detach().cpu().squeeze(0).numpy()
+
+    print(txt_embed1.shape, txt_embed2.shape, gis_embed1.shape, gis_embed2.shape)
+    txt_dist = cdist(txt_embed1, txt_embed2, metric='cosine')
+    gis_dist = cdist(gis_embed1, gis_embed2, metric='cosine')
+    print(txt_dist.shape, gis_dist.shape)
+    print(np.mean(txt_dist), np.max(txt_dist))
+    txt_dist = cdist(txt_embed1, txt_embed3, metric='cosine')
+    gis_dist = cdist(gis_embed1, gis_embed3, metric='cosine')
+    print(txt_dist.shape, gis_dist.shape)
+    print(np.mean(txt_dist), np.max(txt_dist))
